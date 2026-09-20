@@ -1,0 +1,47 @@
+name: Puxa leads do Meta pro CRM
+# Le os leads novos da pagina no Meta (de um servidor cuja leitura a Meta libera) e empurra
+# pro webhook do CRM, que le por id e cria com as travas. Idempotente (nao duplica).
+on:
+  # A cadencia REAL vem do cron da Vercel, que dispara este workflow (workflow_dispatch) a cada
+  # ~20 min no horario comercial. O schedule abaixo e so uma REDE DE SEGURANCA de 3 em 3 horas,
+  # caso o cron da Vercel morra - o GitHub estrangula schedule, entao nao da pra confiar nele
+  # como cadencia principal. Janela de 3 dias garante que nada se perca de qualquer jeito.
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch: {}
+concurrency:
+  group: puxa-leads
+  cancel-in-progress: false
+jobs:
+  puxa:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ler e enviar
+        env:
+          META_LEADS_TOKEN: ${{ secrets.META_LEADS_TOKEN }}
+          META_PAGE_ID: ${{ secrets.META_PAGE_ID }}
+          CRM_WEBHOOK: "https://crm-rachid24.vercel.app/api/webhooks/meta-leads"
+        run: |
+          node -e '
+          (async()=>{
+            const T=process.env.META_LEADS_TOKEN, PAGE=process.env.META_PAGE_ID, G="https://graph.facebook.com/v20.0";
+            const pt=(await (await fetch(G+"/"+PAGE+"?fields=access_token&access_token="+T)).json()).access_token||T;
+            const forms=((await (await fetch(G+"/"+PAGE+"/leadgen_forms?fields=id,name,status&limit=200&access_token="+pt)).json()).data||[]).filter(f=>(f.status||"").toUpperCase()==="ACTIVE");
+            // JANELA LARGA (3 dias): a criacao no CRM e idempotente (nao duplica), entao varrer 3 dias
+            // toda vez garante que NENHUM lead se perca, mesmo se o GitHub atrasar a rodada por horas.
+            const JAN_MIN=Number(process.env.JANELA_MIN||"4320");
+            const corte=Date.now()-JAN_MIN*60*1000; let vistos=0, enviados=0, erros=0;
+            for(const f of forms){ try{
+              // Ja traz field_data/campanha aqui: o CRM cria sem precisar ler o Meta (o IP da Vercel
+              // e bloqueado pra listar; mandar o lead pronto evita depender disso).
+              const l=await (await fetch(G+"/"+f.id+"/leads?fields=id,created_time,field_data,campaign_name,ad_name&limit=50&access_token="+pt)).json();
+              for(const x of (l.data||[])){
+                if(Date.parse(x.created_time)<corte) continue; vistos++;
+                const body={object:"page",entry:[{id:PAGE,changes:[{field:"leadgen",value:{leadgen_id:x.id,page_id:PAGE,form_id:f.id,lead:{field_data:x.field_data,campaign_name:x.campaign_name,ad_name:x.ad_name,form_name:f.name}}}]}]};
+                const r=await fetch(process.env.CRM_WEBHOOK,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+                if(r.ok) enviados++; else { erros++; console.log("webhook nao-ok", r.status, x.id); }
+              }
+            }catch(e){ erros++; console.log("erro form",f.id,e.message);} }
+            console.log("RESULTADO janela(min):", JAN_MIN, "| vistos:", vistos, "| enviados:", enviados, "| erros:", erros);
+          })();
+          '
